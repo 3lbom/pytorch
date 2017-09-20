@@ -4,12 +4,16 @@
 #include "torch/csrc/utils/python_strings.h"
 #include "torch/csrc/autograd/function.h"
 
+#include "pybind11/pybind11.h"
+
 #include <iostream>
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
 #include <stack>
 #include <sstream>
+
+namespace py = pybind11;
 
 namespace torch { namespace jit {
 
@@ -40,8 +44,42 @@ std::ostream& operator<<(std::ostream & out, const node_list & nodes) {
 }
 
 static std::ostream& operator<<(std::ostream & out, THPObjectPtr& obj) {
-   THPObjectPtr repr { PyObject_Repr(obj.get()) };
-   return out << THPUtils_unpackString(repr.get());
+  auto pyobj = py::handle(obj.get());
+  if (py::isinstance<py::tuple>(pyobj)) {
+    // This special-case for printing tuples handles a problem where
+    // str((2L, 3L)) outputs "(2L, 3L)" in Python 2 but "(2, 3)"
+    // in Python 3.  In order to suppress the L-suffix, we must
+    // manually print the string ourselves, calling str() on the
+    // sub-elements.
+    //
+    // This is a fairly fragile fix (What if you have nested tuples
+    // in tuples? What if you have dictionaries?) but it seems to hit
+    // the cases that are triggered in practice in onnx-pytorch.  Revisit
+    // this code if this is not the case.
+    //
+    // By the way, one non-solution for this problem is to monkeypatch
+    // tuple.__str__; this doesn't work because Python doesn't allow
+    // monkeypatching methods of built-in types.
+    auto pytuple = pyobj.cast<py::tuple>();
+    out << "(";
+    size_t i = 0;
+    for (auto& o : pytuple) {
+      if (i > 0) {
+        out << ", ";
+      }
+      THPObjectPtr str(py::str(o).release().ptr());
+      out << THPUtils_unpackString(str.get());
+      i++;
+    }
+    if (i == 1) {
+      out << ",";
+    }
+    out << ")";
+    return out;
+  } else {
+    THPObjectPtr str { PyObject_Str(obj.get()) };
+    return out << THPUtils_unpackString(str.get());
+  }
 }
 
 std::string PythonOp::name() {
@@ -354,7 +392,7 @@ void Node::lint() {
     JIT_ASSERT(inputs_.size() == 2);
   IR_ELSEIF(Mul)
     JIT_ASSERT(inputs_.size() == 2);
-  IR_ELSEIF(Negate)
+  IR_ELSEIF(Neg)
     JIT_ASSERT(inputs_.size() == 1);
   IR_ELSEIF(Sigmoid)
     JIT_ASSERT(inputs_.size() == 1);
@@ -363,7 +401,7 @@ void Node::lint() {
   IR_ELSEIF(FusionGroup)
     // TODO: Typecheck the parameters
     value->g(kSubgraph)->lint();
-  IR_ELSEIF(Chunk)
+  IR_ELSEIF(Split)
     JIT_ASSERT(inputs_.size() == 1);
   IR_END()
 
@@ -445,6 +483,12 @@ void Graph::lint() {
   sum_set.insert(ALL_OF(output_set));
   JIT_ASSERT(std::includes(ALL_OF(sum_set), ALL_OF(all_nodes_set)));
 
+  // graph->stage() should be equal to max(node.stage for node in graph->nodes())
+  if (nodes().begin() == nodes().end()) {
+    JIT_ASSERT(stage() == 0);
+  } else {
+    JIT_ASSERT(stage() == nodes().rbegin()->stage());
+  }
 }
 
 void LintGraph(std::shared_ptr<Graph>& graph) {

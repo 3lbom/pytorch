@@ -8,6 +8,7 @@
 #include "torch/csrc/Exceptions.h"
 #include "torch/csrc/autograd/function.h"
 #include "torch/csrc/autograd/variable.h"
+#include "torch/csrc/autograd/saved_variable.h"
 #include "torch/csrc/utils/object_ptr.h"
 
 // (class, gpu id, sizes)
@@ -28,6 +29,7 @@ struct PyFunction : public Function {
   virtual void releaseVariables() override;
   virtual std::string name() override;
   virtual std::shared_ptr<Function> getSharedPtr() override;
+  virtual bool is_traceable() override;
 
   // THPFunction this Function is wrapping.
   PyObject* obj;
@@ -77,6 +79,7 @@ struct THPFunction {
     // For each input, true if the input is a THPVariable
     std::vector<bool> *is_variable_input;
     char has_freed_buffers;
+    char is_traced;
 
     // The C++ wrapper for this Python function.
     // See a comment in THPFunction_asFunction for details about this field.

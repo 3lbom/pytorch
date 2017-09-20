@@ -10,6 +10,7 @@
 #include <atomic>
 #include <algorithm>
 #include <unordered_set>
+#include <functional>
 #include <cstdint>
 
 #include <ATen/ATen.h>
@@ -22,6 +23,7 @@
 #include "torch/csrc/jit/assert.h"
 #include "torch/csrc/jit/interned_strings.h"
 #include "torch/csrc/jit/attributes.h"
+#include "torch/csrc/jit/resource_guard.h"
 
 namespace torch { namespace autograd {
 
@@ -87,37 +89,31 @@ public:
 struct TensorType : public Type {
   friend struct Type;
   TensorType(const at::Tensor& tensor)
-    : Type(TypeKind::TensorType), scalar_type_(tensor.type().scalarType()) {
-      auto ndim = tensor.dim();
-      sizes_.resize(ndim);
-      strides_.resize(ndim);
-      // NOTE: This is not memcpy! These are assignments.
-      std::copy(tensor.sizes().begin(), tensor.sizes().end(), sizes_.begin());
-      std::copy(tensor.strides().begin(), tensor.strides().end(), strides_.begin());
-  }
-  TensorType(at::ScalarType type, const std::vector<int64_t> & sizes)
-  : Type(TypeKind::TensorType), scalar_type_(type), sizes_(sizes) {
-    strides_.resize(sizes_.size());
-    strides_.back() = 1;
-    for(size_t i = sizes_.size() - 1; i > 0; i--) {
-      strides_[i-1] = strides_[i]*sizes_[i];
-    }
-  }
+    : Type(TypeKind::TensorType)
+    , scalar_type_(tensor.type().scalarType())
+    , device_(tensor.type().isCuda() ? tensor.get_device() : -1)
+    , sizes_(tensor.sizes())
+    , strides_(tensor.strides()) {}
+
   static const TypeKind Kind = TypeKind::TensorType;
-  at::ScalarType scalarType() const {
-    return scalar_type_;
-  }
-  const std::vector<std::int64_t>& sizes() const {
-    return sizes_;
-  }
-  const std::vector<std::int64_t>& strides() const {
-    return strides_;
-  }
+
+  at::ScalarType scalarType() const { return scalar_type_; }
+  int device() const { return device_; }
+  const std::vector<std::int64_t>& sizes() const { return sizes_; }
+  const std::vector<std::int64_t>& strides() const { return strides_; }
+
   TypePtr contiguous() const {
-    return std::make_shared<TensorType>(scalar_type_,sizes_);
+    auto t = std::make_shared<TensorType>(*this);
+    t->strides_.resize(sizes_.size());
+    t->strides_.back() = 1;
+    for(size_t i = t->strides_.size() - 1; i > 0; i--) {
+      t->strides_[i-1] = t->strides_[i] * t->sizes_[i];
+    }
+    return t;
   }
 private:
   at::ScalarType scalar_type_;
+  int device_;
   std::vector<int64_t> sizes_;
   std::vector<int64_t> strides_;
 };
@@ -200,7 +196,6 @@ inline TypePtr getInitialType(NodeKind kind) {
     case kPythonOp:
     case kCppOp:
     case kEval:
-    case kChunk:
     case kFusionGroup:
       return multiType();
     default:
@@ -283,8 +278,9 @@ public:
       return debugName() + "_" + std::to_string(unique());
     return std::to_string(unique());
   }
-  void setStage(size_t s) {
+  Node* setStage(size_t s) {
     stage_ = s;
+    return this;
   }
   size_t stage() {
     return stage_;
@@ -397,6 +393,7 @@ public:
   }
 
   // Insert unattached 'this' node after 'n' in the topological order.
+  // Returns this (for chaining).
   //
   // Given:   %3 = f(%1, %2)
   //          %4 = g(%3)
@@ -405,12 +402,14 @@ public:
   // Result:  %3 = f(%1, %2)
   //          %5 = h(%1)
   //          %4 = g(%3)
-  void insertBefore(Node * n) {
+  Node* insertBefore(Node * n) {
     JIT_ASSERT(n->inGraphList());
     insertAfter(n->prev());
+    return this;
   }
 
   // Insert unattached 'this' node after 'n' in the topological order.
+  // Returns this (for chaining).
   //
   // Given: %3 = f(%1, %2)
   //        %4 = g(%3)
@@ -419,13 +418,14 @@ public:
   // Result:  %3 = f(%1, %2)
   //          %4 = g(%3)
   //          %5 = h(%1)
-  void insertAfter(Node * n) {
+  Node* insertAfter(Node * n) {
     JIT_ASSERT(!inGraphList() && n->inGraphList());
     Node * next = n->next();
     n->next() = this;
     this->prev() = n;
     this->next() = next;
     next->prev() = this;
+    return this;
   }
 
   // Move 'this' (already in the graph) after 'n' in the topological order.
@@ -482,6 +482,11 @@ public:
       dropInput(i);
     inputs_.clear();
   }
+
+  // Replaces all uses of this node with a single Select,
+  // and appends it after this in the graph.
+  // New node inherits the type of this.
+  Node* makeMultireturn();
 
   // iterators of the node list starting at this node
   // useful for resuming a search starting at this node
@@ -710,8 +715,16 @@ public:
   void advanceStage() {
     new_node_stage_++;
   }
+  void setStage(size_t new_stage) {
+    new_node_stage_ = new_stage;
+  }
   size_t stage() {
     return new_node_stage_;
+  }
+  ResourceGuard setStageTemporary(size_t s) {
+    auto prev_stage = new_node_stage_;
+    new_node_stage_ = s;
+    return ResourceGuard([prev_stage, this]() { this->new_node_stage_ = prev_stage; });
   }
 
   void eraseInput(size_t i) {
@@ -755,12 +768,6 @@ public:
     return r;
   }
 
-  Node * createChunk(Node * input, int64_t numChunks, int64_t dim) {
-    auto n = create(kChunk,{input});
-    n->i_(kNumChunks,numChunks);
-    n->i_(kDim, dim);
-    return n;
-  }
   Node * createUndefined() {
     return create(kUndefined);
   }
@@ -838,6 +845,18 @@ inline void Node::destroy() {
   removeAllInputs();
   removeFromList();
   graph_->freeNode(this);
+}
+
+inline Node* Node::makeMultireturn() {
+  JIT_ASSERT(!hasMultipleOutputs());
+  Node *select = graph_->create(kSelect);
+  select->i_(kOffset, 0);
+  select->setType(type_);
+  replaceAllUsesWith(select);
+  select->addInput(this);
+  select->insertAfter(this);
+  setType(multiType());
+  return select;
 }
 
 // Helper macros for constructing switch statements over Node types
@@ -964,11 +983,17 @@ struct CppOp : public Node {
   std::shared_ptr<torch::autograd::Function> fn;
   std::string name();
   CppOp* init(std::shared_ptr<torch::autograd::Function> fn) {
+    JIT_ASSERT(fn);
     this->fn = std::move(fn);
     return this;
   }
   virtual Node * allocNewInstance(Graph * g) override {
     return new CppOp(g);
+  }
+  virtual void cloneFrom(Node * other_) override {
+    Node::cloneFrom(other_);
+    auto other = other_->cast<CppOp>();
+    this->fn = other->fn;
   }
 };
 inline Node * Graph::createCppOp(const std::shared_ptr<torch::autograd::Function> & fn) {

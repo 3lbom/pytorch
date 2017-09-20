@@ -6,7 +6,6 @@
 #include "torch/csrc/utils/functional.h"
 #include "torch/csrc/autograd/function_hook.h"
 #include "torch/csrc/autograd/variable.h"
-#include "torch/csrc/jit/init_pass.h"
 
 #include <memory>
 #include <mutex>
@@ -19,17 +18,17 @@
 namespace torch { namespace jit { namespace tracer {
 
 using torch::autograd::Variable;
-using variable_list = std::vector<std::shared_ptr<Variable>>;
+using variable_list = std::vector<Variable>;
 
 namespace detail {
 
-inline ValueTracingStateElem* getValueState(const std::shared_ptr<TracingState>& state, const std::shared_ptr<Variable>& var, bool alloc = true) {
-  for (auto it = var->tracing_state->begin(); it != var->tracing_state->end();) {
+inline ValueTracingStateElem* getValueState(const std::shared_ptr<TracingState>& state, const Variable& var, bool alloc = true) {
+  for (auto it = var.tracing_state()->begin(); it != var.tracing_state()->end();) {
     auto ts = it->state.lock();
     // GC of invalidated tracing states
     if (!ts) {
       auto current_it = it++;
-      var->tracing_state->erase(current_it);
+      var.tracing_state()->erase(current_it);
       continue;
     } else if (ts == state) {
       return &(*it);
@@ -37,8 +36,8 @@ inline ValueTracingStateElem* getValueState(const std::shared_ptr<TracingState>&
     ++it;
   }
   if (alloc) {
-    var->tracing_state->emplace_front();
-    auto & vts = var->tracing_state->front();
+    var.tracing_state()->emplace_front();
+    auto & vts = var.tracing_state()->front();
     vts.state = state;
     return &vts;
   } else {
@@ -52,7 +51,7 @@ inline bool isElemActive(const ValueTracingStateElem& vts) {
 }
 
 inline std::vector<VariableFlags> getVarFlags(const variable_list& vars) {
-  return fmap(vars, &VariableFlags::create);
+  return fmap(vars, &VariableFlags::of);
 }
 
 }
@@ -63,8 +62,8 @@ inline std::vector<VariableFlags> getVarFlags(const variable_list& vars) {
 // are treated as constants.
 inline bool isTracing(const variable_list& vars) {
   for (auto& var : vars) {
-    if (!var || !var->tracing_state) continue;
-    if (std::any_of(var->tracing_state->begin(), var->tracing_state->end(), detail::isElemActive))
+    if (!var.defined() || !var.tracing_state()) continue;
+    if (std::any_of(var.tracing_state()->begin(), var.tracing_state()->end(), detail::isElemActive))
       return true;
   }
   return false;
@@ -77,8 +76,8 @@ inline bool isTracing(const variable_list& vars) {
 inline std::shared_ptr<TracingState> getTracingState(const variable_list& vars) {
   std::shared_ptr<TracingState> state;
   for (auto& var : vars) {
-    if (!var || !var->tracing_state) continue;
-    for (auto & vts : *var->tracing_state) {
+    if (!var.defined() || !var.tracing_state()) continue;
+    for (auto & vts : *var.tracing_state()) {
       auto var_state = vts.state.lock();
       if (!var_state || !var_state->active) continue;
       if (!state) state = var_state;
@@ -92,7 +91,8 @@ inline std::shared_ptr<TracingState> getTracingState(const variable_list& vars) 
 // Having finished adding a new 'node' to the graph IR owned by TracingState 'state',
 // 'setValueTrace' associates this node with an output variable, so that further operations
 // involving this variable know which node in the IR to reference.
-inline void setValueTrace(const std::shared_ptr<TracingState>& state, const std::shared_ptr<Variable>& var, Node *node) {
+inline void setValueTrace(const std::shared_ptr<TracingState>& state, const Variable& var, Node *node) {
+  JIT_ASSERT(var.defined());
   auto vts = detail::getValueState(state, var);
   vts->trace = node;
 }
@@ -111,8 +111,8 @@ inline void setValueTrace(const std::shared_ptr<TracingState>& state, const std:
 // update on, but subsequently ignores it because the alpha scaling factor is zero.
 // This is one of the cases where a Variable can be created inside of a trace, and
 // if we treat it as a constant, everything will work out.
-inline Node* getValueTrace(const std::shared_ptr<TracingState>& state, const std::shared_ptr<Variable>& var, bool mustExist = false) {
-  if (!var) {
+inline Node* getValueTrace(const std::shared_ptr<TracingState>& state, const Variable& var, bool mustExist = false) {
+  if (!var.defined()) {
     return state->graph->appendNode(state->graph->createUndefined());
   }
   if (mustExist) {
@@ -124,8 +124,8 @@ inline Node* getValueTrace(const std::shared_ptr<TracingState>& state, const std
   auto vts = detail::getValueState(state, var, true);
   if (vts->trace) return vts->trace;
 
-  Node *constant = state->graph->appendNode(state->graph->createConstant(var->data));
-  constant->inferTypeFrom(var->data);
+  Node *constant = state->graph->appendNode(state->graph->createConstant(var.data()));
+  constant->inferTypeFrom(var.data());
   setValueTrace(state, var, constant);
   return constant;
 }
@@ -141,10 +141,10 @@ inline Node* getBufferTrace(const std::unordered_map<void*, Node*>& buffer_map, 
 
 // Only one field may be non-null
 struct TraceInput {
-  std::shared_ptr<Variable> variable;
+  Variable variable;
   at::Tensor buffer;
-  TraceInput(std::shared_ptr<Variable> variable) : variable(variable) {}
-  TraceInput(at::Tensor buffer) : buffer(buffer) {}
+  TraceInput(Variable variable) : variable(std::move(variable)) {}
+  TraceInput(at::Tensor buffer) : buffer(std::move(buffer)) {}
   TraceInput() {}
 };
 
@@ -159,12 +159,12 @@ inline std::shared_ptr<TracingState> enter(std::vector<TraceInput>&& trace_input
   auto state = std::make_shared<TracingState>(num_stages);
   variable_list inputs;
   for (auto& trace_input : trace_inputs) {
-    if (trace_input.variable != nullptr) {
+    if (trace_input.variable.defined()) {
       JIT_ASSERT(!trace_input.buffer.defined());
       auto& input = trace_input.variable;
       Node *input_node = state->graph->addInput();
       setValueTrace(state, input, input_node);
-      input_node->inferTypeFrom(input->data);
+      input_node->inferTypeFrom(input.data());
       inputs.push_back(input);
     } else {
       JIT_ASSERT(trace_input.buffer.defined());
@@ -212,5 +212,24 @@ inline void exit(const variable_list& outputs) {
 // Marks part of the backward graph as non-traceable (i.e. one that should be replaced
 // with an Eval in the trace).
 void nontraceableBackwardSubgraph(const variable_list& inputs, const variable_list& outputs);
+
+// These definitions require Variable struct to be defined, so they can't be
+// in tracer_state.h
+inline VariableFlags VariableFlags::of(const Variable& var) {
+  VariableFlags f;
+  if (var.defined()) {
+    f.was_null = false;
+    f.requires_grad = var.requires_grad();
+    f.is_volatile = var.is_volatile();
+  } else {
+    f.was_null = true;
+  }
+  return f;
+}
+
+inline bool VariableFlags::verify(const Variable& var) {
+  if (!var.defined()) return was_null;
+  return !was_null && requires_grad == var.requires_grad() && is_volatile == var.is_volatile();
+}
 
 }}} // namespace torch::jit::tracer

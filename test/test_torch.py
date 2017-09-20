@@ -400,10 +400,10 @@ class TestTorch(TestCase):
         a = torch.randn(100, 89)
         zeros = torch.Tensor().resize_as_(a).zero_()
 
-        res_pow = torch.pow(a, -1)
+        res_div = 1 / a
         res_reciprocal = a.clone()
         res_reciprocal.reciprocal_()
-        self.assertEqual(res_reciprocal, res_pow)
+        self.assertEqual(res_reciprocal, res_div)
 
     def test_mul(self):
         m1 = torch.randn(10, 10)
@@ -668,22 +668,24 @@ class TestTorch(TestCase):
     def test_pow(self):
         # [res] torch.pow([res,] x)
 
-        # base - tensor, exponent - number
-        # contiguous
-        m1 = torch.randn(100, 100)
-        res1 = torch.pow(m1[4], 3)
-        res2 = res1.clone().zero_()
-        for i in range(res2.size(0)):
-            res2[i] = math.pow(m1[4][i], 3)
-        self.assertEqual(res1, res2)
+        # pow has dedicated implementation for different exponents
+        for exponent in [-2, -1, -0.5, 0.5, 1, 2, 3, 4]:
+            # base - tensor, exponent - number
+            # contiguous
+            m1 = torch.rand(100, 100) + 0.5
+            res1 = torch.pow(m1[4], exponent)
+            res2 = res1.clone().zero_()
+            for i in range(res2.size(0)):
+                res2[i] = math.pow(m1[4][i], exponent)
+            self.assertEqual(res1, res2)
 
-        # non-contiguous
-        m1 = torch.randn(100, 100)
-        res1 = torch.pow(m1[:, 4], 3)
-        res2 = res1.clone().zero_()
-        for i in range(res2.size(0)):
-            res2[i] = math.pow(m1[i, 4], 3)
-        self.assertEqual(res1, res2)
+            # non-contiguous
+            m1 = torch.rand(100, 100) + 0.5
+            res1 = torch.pow(m1[:, 4], exponent)
+            res2 = res1.clone().zero_()
+            for i in range(res2.size(0)):
+                res2[i] = math.pow(m1[i, 4], exponent)
+            self.assertEqual(res1, res2)
 
         # base - number, exponent - tensor
         # contiguous
@@ -701,6 +703,10 @@ class TestTorch(TestCase):
         for i in range(res2.size(0)):
             res2[i] = math.pow(3, m1[i][4])
         self.assertEqual(res1, res2)
+
+    def test_rpow(self):
+        m = torch.randn(10, 10)
+        self.assertEqual(torch.pow(2, m), 2**m)
 
     def _test_cop(self, torchfn, mathfn):
         def reference_implementation(res2):
@@ -3112,6 +3118,63 @@ class TestTorch(TestCase):
 
     def test_advancedindex_big(self):
         self._test_advancedindex_big(self, lambda x: x)
+
+    @unittest.skipIf(not TEST_NUMPY, "Numpy not found")
+    def test_newaxis_numpy_comparison(self):
+        def run_test(tensor, *idx):
+            npt = tensor.numpy()
+            self.assertEqual(tensor[idx], npt[idx])
+
+        # 1D Tensor Tests
+        x = torch.arange(0, 10)
+        cases = [
+            [None],
+            [None, None],
+            [Ellipsis, None],
+            [None, Ellipsis],
+            [2, None],
+            [None, 2],
+            [Ellipsis, None, 2],
+            [Ellipsis, 2, None],
+            [2, Ellipsis, None],
+            [2, None, Ellipsis],
+            [None, 2, Ellipsis],
+            [None, Ellipsis, 2],
+        ]
+
+        for case in cases:
+            run_test(x, *case)
+
+        # 2D Tensor Tests
+        x = torch.arange(0, 12).view(3, 4)
+        cases = [
+            [None],
+            [None, None],
+            [None, None, None],
+            [Ellipsis, None],
+            [Ellipsis, None, None],
+            [None, Ellipsis],
+            [None, Ellipsis, None],
+            [None, None, Ellipsis],
+            [2, None],
+            [2, None, Ellipsis],
+            [2, Ellipsis, None],
+            [None, 2, Ellipsis],
+            [Ellipsis, 2, None],
+            [Ellipsis, None, 2],
+            [None, Ellipsis, 2],
+            [1, 2, None],
+            [1, 2, Ellipsis, None],
+            [1, Ellipsis, 2, None],
+            [Ellipsis, 1, None, 2],
+            [Ellipsis, 1, 2, None],
+            [1, None, 2, Ellipsis],
+            [None, 1, Ellipsis, 2],
+            [None, 1, 2, Ellipsis],
+        ]
+
+        for case in cases:
+            run_test(x, *case)
 
     def test_newindex(self):
         reference = self._consecutive((3, 3, 3))
