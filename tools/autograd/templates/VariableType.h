@@ -4,43 +4,52 @@
 
 #include <ATen/ATen.h>
 
+#include <c10/util/intrusive_ptr.h>
+
+#include <torch/csrc/WindowsTorchApiMacro.h>
+
+#include <cstdint> // for size_t
+#include <functional> // for function
+#include <memory> // for unique_ptr
+#include <string>
+#include <vector>
+
+namespace at {
+  struct Quantizer;
+};
+
 namespace torch { namespace autograd {
 
+using Variable = at::Tensor;
 using at::Context;
+using at::Device;
+using at::Dimname;
+using at::DimnameList;
 using at::Generator;
-using at::IntList;
+using at::IntArrayRef;
+using at::MemoryFormat;
+using at::QScheme;
 using at::Scalar;
-using at::SparseTensor;
+using at::ScalarType;
 using at::Storage;
 using at::Tensor;
 using at::TensorList;
-using at::Type;
+using at::TensorOptions;
+using at::Quantizer;
+// This is temporary typedef to enable Quantizer in aten native function API
+// we'll remove them when we are actually exposing Quantizer class
+// to frontend
+using ConstQuantizerPtr = const c10::intrusive_ptr<Quantizer>&;
+using c10::optional;
 
-struct VariableType : public at::Type {
-  VariableType(Context* context, at::Type* baseType);
-  virtual at::ScalarType scalarType() override;
-  virtual at::Backend backend() override;
-  virtual bool isCuda() override;
-  virtual bool isSparse() override;
-  virtual bool isDistributed() override;
-  virtual std::unique_ptr<at::Storage> storage() override;
-  virtual std::unique_ptr<at::Storage> storage(size_t size) override;
-  virtual std::unique_ptr<at::Storage> storageFromBlob(void * data, int64_t size) override;
-  virtual std::unique_ptr<at::Generator> generator() override;
-  virtual const char * toString() const override;
-  virtual at::TypeID ID() const override;
-  virtual size_t elementSizeInBytes() const override;
-  static const char * typeString();
-  at::Tensor unsafeTensorFromTH(void * th_pointer, bool retain) override;
+namespace VariableType {
+  TORCH_API std::vector<at::DeprecatedTypeProperties*> allCUDATypes();
+  TORCH_API std::vector<at::DeprecatedTypeProperties*> allCPUTypes();
 
-  virtual void copy(const at::Tensor & src, at::Tensor & dst) override;
-  ${type_derived_method_declarations}
-
-private:
-  at::Tensor & checked_unpack(const Tensor & t, const char * name, int pos) const;
-
-private:
-  at::Type* baseType;
+  at::Tensor & unpack(Tensor & t, const char * name, int pos);
+  const at::Tensor & unpack(const Tensor & t, const char * name, int pos);
+  at::Tensor unpack_opt(const Tensor & t, const char * name, int pos);
+  std::vector<at::Tensor> unpack(at::TensorList tl, const char *name, int pos);
 };
 
 }} // namespace torch::autograd
